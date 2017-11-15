@@ -18,6 +18,9 @@ package service
 
 import (
 	"errors"
+	"fmt"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/constant"
@@ -25,12 +28,15 @@ import (
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/remoting"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
 	"github.com/golang/glog"
-	"time"
 )
+
+type MessageQueueSelector func([]model.MessageQueue, *model.Message, interface{}) (model.MessageQueue, error)
 
 type ProducerService interface {
 	CheckConfig() (err error)
 	SendDefaultImpl(message *model.Message, communicationMode string, sendCallback string, timeout int64) (sendResult *model.SendResult, err error)
+	SendSelectImpl(message *model.Message, selector MessageQueueSelector, arg interface{}, communicationMode string, sendCallback string, timeout int64) (sendResult *model.SendResult, err error)
+	SendQueueImpl(message *model.Message, queue model.MessageQueue, communicationMode string, sendCallback string, timeout int64) (sendResult *model.SendResult, err error)
 }
 
 type DefaultProducerService struct {
@@ -73,6 +79,49 @@ func (self *DefaultProducerService) SendDefaultImpl(message *model.Message, comm
 	glog.V(2).Info("op=look topicPublishInfo", topicPublishInfo)
 	//if(!ok) return error
 	sendResult, err = self.sendMsgUseTopicPublishInfo(message, communicationMode, sendCallback, topicPublishInfo, timeout)
+	return
+}
+
+func (self *DefaultProducerService) SendSelectImpl(message *model.Message, selector MessageQueueSelector, arg interface{}, communicationMode string, sendCallback string, timeout int64) (sendResult *model.SendResult, err error) {
+	var (
+		topicPublishInfo *model.TopicPublishInfo
+	)
+	err = self.checkMessage(message)
+	if err != nil {
+		return
+	}
+	topicPublishInfo, err = self.mqClient.TryToFindTopicPublishInfo(message.Topic)
+	if err != nil {
+		return
+	}
+	if topicPublishInfo.JudgeTopicPublishInfoOk() == false {
+		err = errors.New("topicPublishInfo is error,topic=" + message.Topic)
+		return
+	}
+	glog.V(2).Info("op=look topicPublishInfo", topicPublishInfo)
+
+	messageQueue, err := selector(topicPublishInfo.MessageQueueList, message, arg)
+	if err != nil {
+		return
+	}
+
+	//TODO add retry
+	sendResult, err = self.doSendMessage(message, messageQueue, communicationMode, sendCallback, topicPublishInfo, timeout)
+	return
+}
+
+func (self *DefaultProducerService) SendQueueImpl(message *model.Message, queue model.MessageQueue, communicationMode string, sendCallback string, timeout int64) (sendResult *model.SendResult, err error) {
+	err = self.checkMessage(message)
+	if err != nil {
+		return
+	}
+	if message.Topic != queue.Topic {
+		err = fmt.Errorf("message's topic not equal queue's topic")
+		return
+	}
+
+	// TODO add retry
+	sendResult, err = self.doSendMessage(message, queue, communicationMode, sendCallback, nil, timeout)
 	return
 }
 

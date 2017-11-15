@@ -17,14 +17,15 @@
 package main
 
 import (
+	"net/http"
+	_ "net/http/pprof"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go" //todo todo  I want only import this
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
 	"github.com/golang/glog"
-	"net/http"
-	_ "net/http/pprof"
-	"time"
 )
 
 func main() {
@@ -32,7 +33,7 @@ func main() {
 		http.ListenAndServe("localhost:6060", nil)
 	}()
 	var (
-		testTopic = "GoLang"
+		testTopic = "example-topic"
 	)
 	var producer1 = rocketmq.NewDefaultMQProducer("Test1")
 	producer1.ProducerConfig.CompressMsgBodyOverHowMuch = 1
@@ -52,13 +53,13 @@ func main() {
 		return model.ConsumeConcurrentlyResult{ConsumeConcurrentlyStatus: model.CONSUME_SUCCESS, AckIndex: len(msgs)}
 	})
 	var clienConfig = &config.ClientConfig{}
-	clienConfig.SetNameServerAddress("120.55.113.35:9876")
+	clienConfig.SetNameServerAddress("10.101.1.12:9876")
 	rocketMqManager := rocketmq.MqClientManagerInit(clienConfig)
 	rocketMqManager.RegistProducer(producer1)
 	rocketMqManager.RegistProducer(producer2)
 	rocketMqManager.RegistConsumer(comsumer1)
 	rocketMqManager.Start()
-	for i := 0; i < 10000000; i++ {
+	for i := 0; i < 10; i++ {
 		var message = &model.Message{}
 		message.Topic = testTopic
 		message.SetKeys([]string{"xxx"})

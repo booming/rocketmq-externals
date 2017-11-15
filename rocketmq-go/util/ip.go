@@ -23,7 +23,9 @@ import (
 
 func GetIp4Bytes() (ret []byte) {
 	ip := getIp()
-	ret = ip[len(ip)-4:]
+	if len(ip) >= 4 {
+		ret = ip[len(ip)-4:]
+	}
 	return
 }
 

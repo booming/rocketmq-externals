@@ -1,6 +1,5 @@
 package rocketmq
 
-import ()
 import (
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
@@ -10,7 +9,9 @@ import (
 
 type RocketMQProducer interface {
 	Send(message *model.Message) (sendResult *model.SendResult, err error)
-	SendWithTimeout(message *model.Message, timeout int) (sendResult *model.SendResult, err error)
+	SendWithTimeout(message *model.Message, timeout int64) (sendResult *model.SendResult, err error)
+	SendToQueue(message *model.Message, queue model.MessageQueue, timeout int64) (sendResult *model.SendResult, err error)
+	SendWithSelector(message *model.Message, selector service.MessageQueueSelector, arg interface{}, timeout int64) (sendResult *model.SendResult, err error)
 	//SendAsync(message *model.Message) (sendResult *model.SendResult,err error)
 	//SendAsyncWithTimeout(message *model.Message) (sendResult *model.SendResult,err error)
 	//SendOneWay(message *model.Message) (sendResult *model.SendResult,err error)
@@ -36,5 +37,15 @@ func (self *DefaultMQProducer) Send(message *model.Message) (sendResult *model.S
 }
 func (self *DefaultMQProducer) SendWithTimeout(message *model.Message, timeout int64) (sendResult *model.SendResult, err error) {
 	sendResult, err = self.producerService.SendDefaultImpl(message, constant.COMMUNICATIONMODE_SYNC, "", timeout)
+	return
+}
+
+func (self *DefaultMQProducer) SendToQueue(message *model.Message, queue model.MessageQueue, timeout int64) (sendResult *model.SendResult, err error) {
+	sendResult, err = self.producerService.SendQueueImpl(message, queue, constant.COMMUNICATIONMODE_SYNC, "", timeout)
+	return
+}
+
+func (self *DefaultMQProducer) SendWithSelector(message *model.Message, selector service.MessageQueueSelector, arg interface{}, timeout int64) (sendResult *model.SendResult, err error) {
+	sendResult, err = self.producerService.SendSelectImpl(message, selector, arg, constant.COMMUNICATIONMODE_SYNC, "", timeout)
 	return
 }
