@@ -17,12 +17,13 @@
 package rocketmq
 
 import (
+	"strings"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/service"
 	"github.com/golang/glog"
-	"strings"
-	"time"
 )
 
 type Consumer interface {
@@ -33,9 +34,10 @@ type Consumer interface {
 type DefaultMQPushConsumer struct {
 	consumerGroup string
 	//consumeFromWhere      string
-	consumeType  string
-	messageModel string
-	unitMode     bool
+	consumeType    string
+	messageModel   string
+	unitMode       bool
+	consumeOrderly bool
 
 	subscription          map[string]string   //topic|subExpression
 	subscriptionTag       map[string][]string // we use it filter again
@@ -80,6 +82,16 @@ func (self *DefaultMQPushConsumer) Subscribe(topic string, subExpression string)
 
 func (self *DefaultMQPushConsumer) RegisterMessageListener(messageListener model.MessageListener) {
 	self.consumeMessageService = service.NewConsumeMessageConcurrentlyServiceImpl(messageListener)
+	self.consumeOrderly = false
+}
+
+func (self *DefaultMQPushConsumer) RegisterMessageListenerOrderly(messageListenerOrderly model.MessageListenerOrderly) {
+	self.consumeMessageService = service.NewConsumeMessageOrderlyServiceImpl(messageListenerOrderly)
+	self.consumeOrderly = true
+}
+
+func (self *DefaultMQPushConsumer) IsConsumeOrderly() bool {
+	return self.consumeOrderly
 }
 
 func (self *DefaultMQPushConsumer) resetOffset(offsetTable map[model.MessageQueue]int64) {
@@ -93,7 +105,7 @@ func (self *DefaultMQPushConsumer) resetOffset(offsetTable map[model.MessageQueu
 		<-waitTime.C
 		defer func() {
 			self.pause = false
-			self.rebalance.DoRebalance()
+			self.rebalance.DoRebalance(self.consumeOrderly)
 		}()
 
 		for messageQueue, offset := range offsetTable {
@@ -116,6 +128,7 @@ func (self *DefaultMQPushConsumer) Subscriptions() []*model.SubscriptionData {
 	return subscriptions
 }
 
+// 把超时的消息发回broker，并从ProcessQueue中删除；顺序消费不这样做
 func (self *DefaultMQPushConsumer) CleanExpireMsg() {
 	nowTime := int64(time.Now().UnixNano()) / 1000000 //will cause nowTime - consumeStartTime <0 ,but no matter
 	messageQueueList, processQueueList := self.rebalance.GetProcessQueueList()
@@ -125,7 +138,7 @@ func (self *DefaultMQPushConsumer) CleanExpireMsg() {
 			loop = 16
 		}
 		for i := 0; i < loop; i++ {
-			_, message := processQueue.GetMinMessageInTree()
+			_, message := processQueue.GetMinMessageInTree()  // message是最早的一条消息
 			if message == nil {
 				break
 			}

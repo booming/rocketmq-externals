@@ -18,12 +18,13 @@ package service
 
 import (
 	"errors"
+	"strconv"
+	"sync"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/header"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/remoting"
 	"github.com/golang/glog"
-	"strconv"
-	"sync"
 )
 
 const (
@@ -58,6 +59,8 @@ func (self *RemoteOffsetStore) RemoveOffset(mq *model.MessageQueue) {
 	delete(self.offsetTable, *mq)
 }
 
+// update message queue's offset in broker
+// Currently this method is only invoked when a messageQueue is removed from processQueueMap in rebalance
 func (self *RemoteOffsetStore) Persist(mq *model.MessageQueue) {
 	brokerAddr := self.mqClient.FetchMasterBrokerAddress(mq.BrokerName)
 	if len(brokerAddr) == 0 {
@@ -76,6 +79,7 @@ func (self *RemoteOffsetStore) ReadOffset(mq *model.MessageQueue, readType int) 
 
 	switch readType {
 	case MEMORY_FIRST_THEN_STORE:
+	// read from local; invoked when pulling request (refer to pull_message_controller.go)
 	case READ_FROM_MEMORY:
 		self.offsetTableLock.RLock()
 		offset, ok := self.offsetTable[*mq]
@@ -85,6 +89,7 @@ func (self *RemoteOffsetStore) ReadOffset(mq *model.MessageQueue, readType int) 
 		} else {
 			return -1
 		}
+	// read from broker; invoked when a queue is added to a consumer (refer to rebalance.go)
 	case READ_FROM_STORE:
 		offset, err := self.fetchConsumeOffsetFromBroker(mq)
 		if err != nil {
@@ -104,6 +109,7 @@ func (self *RemoteOffsetStore) fetchConsumeOffsetFromBroker(mq *model.MessageQue
 	brokerAddr, _, found := self.mqClient.FindBrokerAddressInSubscribe(mq.BrokerName, 0, false)
 
 	if !found {
+		// why try it again?
 		brokerAddr, _, found = self.mqClient.FindBrokerAddressInSubscribe(mq.BrokerName, 0, false)
 	}
 
@@ -118,6 +124,7 @@ func (self *RemoteOffsetStore) fetchConsumeOffsetFromBroker(mq *model.MessageQue
 	return -1, errors.New("fetch consumer offset error")
 }
 
+// query consumer offset from broker
 func (self RemoteOffsetStore) queryConsumerOffset(addr string, requestHeader *header.QueryConsumerOffsetRequestHeader, timeoutMillis int64) (int64, error) {
 	remotingCommand := remoting.NewRemotingCommand(remoting.QUERY_CONSUMER_OFFSET, requestHeader)
 	reponse, err := self.mqClient.GetRemotingClient().InvokeSync(addr, remotingCommand, timeoutMillis)

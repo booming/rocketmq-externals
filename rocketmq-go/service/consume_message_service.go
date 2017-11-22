@@ -17,19 +17,20 @@
 package service
 
 import (
+	"sync"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/constant"
 	"github.com/golang/glog"
-	"time"
 )
 
 type ConsumeMessageService interface {
 	//ConsumeMessageDirectlyResult consumeMessageDirectly(final MessageExt msg, final String brokerName);
 
-	Init(consumerGroup string, mqClient RocketMqClient, offsetStore OffsetStore, defaultProducerService *DefaultProducerService, consumerConfig *config.RocketMqConsumerConfig)
-	SubmitConsumeRequest(msgs []model.MessageExt, processQueue *model.ProcessQueue,
-		messageQueue *model.MessageQueue, dispathToConsume bool)
+	Init(consumerGroup string, mqClient RocketMqClient, rebalance *Rebalance, offsetStore OffsetStore, defaultProducerService *DefaultProducerService, consumerConfig *config.RocketMqConsumerConfig)
+	SubmitConsumeRequest(msgs []model.MessageExt, processQueue *model.ProcessQueue, messageQueue *model.MessageQueue, dispathToConsume bool)
 	SendMessageBack(messageExt *model.MessageExt, delayLayLevel int, brokerName string) (err error)
 	ConsumeMessageDirectly(messageExt *model.MessageExt, brokerName string) (consumeMessageDirectlyResult model.ConsumeMessageDirectlyResult, err error)
 }
@@ -42,19 +43,42 @@ type ConsumeMessageConcurrentlyServiceImpl struct {
 	consumerConfig                 *config.RocketMqConsumerConfig
 }
 
+type ConsumeMessageOrderlyServiceImpl struct {
+	consumerGroup   string
+	messageListener model.MessageListenerOrderly
+	offsetStore     OffsetStore
+	consumerConfig  *config.RocketMqConsumerConfig //对应Java中的defaultMQPushConsumer
+	mqLockTable     sync.Map
+	rebalance       *Rebalance
+}
+
 func NewConsumeMessageConcurrentlyServiceImpl(messageListener model.MessageListener) (consumeService ConsumeMessageService) {
 	consumeService = &ConsumeMessageConcurrentlyServiceImpl{messageListener: messageListener, sendMessageBackProducerService: &SendMessageBackProducerServiceImpl{}}
 	return
 }
 
-func (self *ConsumeMessageConcurrentlyServiceImpl) Init(consumerGroup string, mqClient RocketMqClient, offsetStore OffsetStore, defaultProducerService *DefaultProducerService, consumerConfig *config.RocketMqConsumerConfig) {
+//
+func NewConsumeMessageOrderlyServiceImpl(messageListener model.MessageListenerOrderly) (consumeService ConsumeMessageService) {
+	consumeService = &ConsumeMessageOrderlyServiceImpl{messageListener: messageListener}
+	return
+}
+
+func (self *ConsumeMessageConcurrentlyServiceImpl) Init(consumerGroup string, mqClient RocketMqClient, rebalance *Rebalance, offsetStore OffsetStore, defaultProducerService *DefaultProducerService, consumerConfig *config.RocketMqConsumerConfig) {
 	self.consumerGroup = consumerGroup
 	self.offsetStore = offsetStore
 	self.sendMessageBackProducerService.InitSendMessageBackProducerService(consumerGroup, mqClient, defaultProducerService, consumerConfig)
 	self.consumerConfig = consumerConfig
 }
 
-func (self *ConsumeMessageConcurrentlyServiceImpl) SubmitConsumeRequest(msgs []model.MessageExt, processQueue *model.ProcessQueue, messageQueue *model.MessageQueue, dispathToConsume bool) {
+//
+func (self *ConsumeMessageOrderlyServiceImpl) Init(consumerGroup string, mqClient RocketMqClient, rebalance *Rebalance, offsetStore OffsetStore, defaultProducerService *DefaultProducerService, consumerConfig *config.RocketMqConsumerConfig) {
+	self.consumerGroup = consumerGroup
+	self.rebalance = rebalance
+	self.offsetStore = offsetStore
+	self.consumerConfig = consumerConfig
+}
+
+func (self *ConsumeMessageConcurrentlyServiceImpl) SubmitConsumeRequest(msgs []model.MessageExt, processQueue *model.ProcessQueue, messageQueue *model.MessageQueue, dispatchToConsume bool) {
 	msgsLen := len(msgs)
 	for i := 0; i < msgsLen; {
 		begin := i
@@ -73,9 +97,80 @@ func (self *ConsumeMessageConcurrentlyServiceImpl) SubmitConsumeRequest(msgs []m
 	return
 }
 
+func (self *ConsumeMessageOrderlyServiceImpl) SubmitConsumeRequest(msg []model.MessageExt, processQueue *model.ProcessQueue, messageQueue *model.MessageQueue, dispatchToConsume bool) {
+	if dispatchToConsume {
+		go func() {
+			if processQueue.IsDropped() {
+				glog.Warningf("the message queue %+v not be able to consume, because it's dropped.", *messageQueue)
+				return
+			}
+
+			mqLock := self.fetchMessageQueueLock(*messageQueue)
+			defer mqLock.Unlock()
+			mqLock.Lock()
+			if processQueue.IsLocked() && !processQueue.IsLockExpired() {
+				beginTime := time.Now()
+				for continueConsume := true; continueConsume; {
+					if processQueue.IsDropped() {
+						glog.Warningf("the message queue not be able to consume, because it's dropped. %+v", *messageQueue)
+						break
+					}
+					if !processQueue.IsLocked() {
+						glog.Warningf("the message queue not locked, so consume later, %+v", *messageQueue)
+						self.tryLockLaterAndReconsume(messageQueue, processQueue, 10*time.Millisecond)
+						break
+					}
+					if processQueue.IsLockExpired() {
+						glog.Warningf("the message queue lock expired, so consume later, %+v", *messageQueue)
+						self.tryLockLaterAndReconsume(messageQueue, processQueue, 10*time.Millisecond)
+						break
+					}
+					interval := time.Now().Sub(beginTime)
+					if interval > constant.MAX_TIME_CONSUME_CONTINUOUSLY {
+						glog.Warningf("xx")
+						self.submitConsumeRequestLater(processQueue, messageQueue, 10*time.Millisecond)
+						break
+					}
+
+					batchMsgs := processQueue.TakeMessages(self.consumerConfig.ConsumeMessageBatchMaxSize)
+					if len(batchMsgs) > 0 {
+						consumeState := self.messageListener(batchMsgs)
+						// defer processQueue.GetLockConsume().Unlock()
+						// processQueue.GetLockConsume().Lock()
+						if processQueue.IsDropped() {
+							break
+						}
+						continueConsume = self.processConsumeResult(consumeState, batchMsgs, messageQueue, processQueue)
+					} else {
+						continueConsume = false
+					}
+				}
+			} else {
+				if processQueue.IsDropped() {
+					glog.Warningf("the message queue not be able to consume, because it's dropped. %+v", *messageQueue)
+					return
+				}
+				glog.Warning("Fail to acquire locks from broker, try to lock later and reconsume")
+				self.tryLockLaterAndReconsume(messageQueue, processQueue, 100*time.Millisecond)
+			}
+		}()
+	}
+}
+
+func (self *ConsumeMessageOrderlyServiceImpl) submitConsumeRequestLater(processQueue *model.ProcessQueue, messageQueue *model.MessageQueue, delay time.Duration) {
+	go func() {
+		<-time.After(delay)
+		self.SubmitConsumeRequest(nil, processQueue, messageQueue, true)
+	}()
+}
+
 func (self *ConsumeMessageConcurrentlyServiceImpl) SendMessageBack(messageExt *model.MessageExt, delayLayLevel int, brokerName string) (err error) {
 	err = self.sendMessageBackProducerService.SendMessageBack(messageExt, 0, brokerName)
 	return
+}
+
+func (self *ConsumeMessageOrderlyServiceImpl) SendMessageBack(messageExt *model.MessageExt, delayLayLevel int, brokerName string) error {
+	return nil
 }
 
 func (self *ConsumeMessageConcurrentlyServiceImpl) ConsumeMessageDirectly(messageExt *model.MessageExt, brokerName string) (consumeMessageDirectlyResult model.ConsumeMessageDirectlyResult, err error) {
@@ -89,6 +184,20 @@ func (self *ConsumeMessageConcurrentlyServiceImpl) ConsumeMessageDirectly(messag
 
 	} else {
 		consumeMessageDirectlyResult.ConsumeResult = "CR_THROW_EXCEPTION"
+	}
+	return
+}
+
+func (self *ConsumeMessageOrderlyServiceImpl) ConsumeMessageDirectly(messageExt *model.MessageExt, brokerName string) (consumeMessageDirectlyResult model.ConsumeMessageDirectlyResult, err error) {
+	start := time.Now().UnixNano() / 1000000
+	consumeResult := self.messageListener([]model.MessageExt{*messageExt})
+	consumeMessageDirectlyResult.AutoCommit = true
+	consumeMessageDirectlyResult.Order = true
+	consumeMessageDirectlyResult.SpentTimeMills = time.Now().UnixNano()/1000000 - start
+	if consumeResult.ConsumeOrderlyStatus == "SUCCESS" {
+		consumeMessageDirectlyResult.ConsumeResult = "CR_SUCCESS"
+	} else {
+		consumeMessageDirectlyResult.ConsumeResult = "CR_LATER"
 	}
 	return
 }
@@ -135,6 +244,24 @@ func (self *ConsumeMessageConcurrentlyServiceImpl) processConsumeResult(result m
 
 }
 
+func (self *ConsumeMessageOrderlyServiceImpl) processConsumeResult(result model.ConsumeOrderlyResult, msgs []model.MessageExt, messageQueue *model.MessageQueue, processQueue *model.ProcessQueue) bool {
+	continueConsume := true
+	var commitOffset int64 = -1
+	if result.ConsumeOrderlyStatus == model.SUSPEND_CURRENT_QUEUE_A_MOMENT {
+		processQueue.MakeMessagesConsumeAgain(msgs)
+		self.submitConsumeRequestLater(processQueue, messageQueue, 10*time.Millisecond)
+		continueConsume = false
+	} else {
+		// msgs消费成功
+		// msgs是按照QueueOffset排序的数组，最后一个元素offset最大
+		commitOffset = processQueue.Commit(msgs)
+	}
+	if commitOffset >= 0 && !processQueue.IsDropped() {
+		self.offsetStore.UpdateOffset(messageQueue, commitOffset, false)
+	}
+	return continueConsume
+}
+
 func transformMessageToConsume(consumerGroup string, msgs []model.MessageExt) []model.MessageExt {
 	retryTopicName := constant.RETRY_GROUP_TOPIC_PREFIX + consumerGroup
 
@@ -150,4 +277,29 @@ func transformMessageToConsume(consumerGroup string, msgs []model.MessageExt) []
 		msg.SetConsumeStartTime()
 	}
 	return msgs
+}
+
+func (self *ConsumeMessageOrderlyServiceImpl) fetchMessageQueueLock(mq model.MessageQueue) *sync.Mutex {
+	val, ok := self.mqLockTable.Load(mq)
+	if ok {
+		return val.(*sync.Mutex)
+	}
+	lock := new(sync.Mutex)
+	val, loaded := self.mqLockTable.LoadOrStore(mq, lock)
+	if loaded {
+		lock = val.(*sync.Mutex)
+	}
+	return lock
+}
+
+func (self *ConsumeMessageOrderlyServiceImpl) tryLockLaterAndReconsume(messageQueue *model.MessageQueue, processQueue *model.ProcessQueue, delay time.Duration) {
+	go func() {
+		<-time.After(delay)
+		lockOK := self.rebalance.Lock(messageQueue)
+		if lockOK {
+			self.submitConsumeRequestLater(processQueue, messageQueue, 10*time.Millisecond)
+		} else {
+			self.submitConsumeRequestLater(processQueue, messageQueue, 3*time.Second)
+		}
+	}()
 }

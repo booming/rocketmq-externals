@@ -28,6 +28,6 @@ func NewRebalanceController(clientFactory *ClientFactory) *RebalanceController {
 
 func (self *RebalanceController) doRebalance() {
 	for _, consumer := range self.clientFactory.ConsumerTable {
-		consumer.rebalance.DoRebalance()
+		consumer.rebalance.DoRebalance(consumer.consumeOrderly)
 	}
 }

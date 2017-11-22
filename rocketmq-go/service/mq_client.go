@@ -20,6 +20,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/constant"
@@ -27,10 +32,6 @@ import (
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/remoting"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
 	"github.com/golang/glog"
-	"os"
-	"strconv"
-	"strings"
-	"time"
 )
 
 //this struct is for something common,for example
@@ -55,6 +56,8 @@ type RocketMqClient interface {
 	ClearExpireResponse()
 	GetMaxOffset(mq *model.MessageQueue) int64
 	SearchOffset(mq *model.MessageQueue, time time.Time) int64
+	LockBatchMQ(addr string, reqBody *model.LockBatchRequestBody, timeoutMillis int64) ([]*model.MessageQueue, error)
+	UnlockBatchMQ(addr string, reqBody *model.UnlockBatchRequestBody, timeoutMillis int64, oneway bool) error
 }
 
 var DEFAULT_TIMEOUT int64 = 6000
@@ -355,6 +358,55 @@ func (self MqClientImpl) SendHeartbeatToAllBroker(heartBeatData *model.Heartbeat
 			glog.V(2).Info("send heartbeat to broker[", addr+"]")
 			self.sendHeartBeat(addr, remotingCommand, 3000)
 
+		}
+	}
+	return nil
+}
+
+func (self MqClientImpl) LockBatchMQ(addr string, reqBody *model.LockBatchRequestBody, timeoutMillis int64) (queues []*model.MessageQueue, err error) {
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		glog.Error(err)
+		return nil, err
+	}
+	remotingCommand := remoting.NewRemotingCommandWithBody(remoting.LOCK_BATCH_MQ, nil, body)
+	remotingCommand, err = self.remotingClient.InvokeSync(addr, remotingCommand, timeoutMillis)
+	if err != nil {
+		glog.Error(err)
+	} else {
+		if remotingCommand == nil || remotingCommand.Code != remoting.SUCCESS {
+			err = fmt.Errorf("lock batch mq error")
+		} else {
+			respBody := new(model.LockBatchResponseBody)
+			err = json.Unmarshal(remotingCommand.Body, respBody)
+			if err != nil {
+				glog.Error(err, string(remotingCommand.Body))
+				return
+			}
+			queues = respBody.LockOKMQSet
+		}
+	}
+	return
+}
+
+func (self MqClientImpl) UnlockBatchMQ(addr string, reqBody *model.UnlockBatchRequestBody, timeoutMillis int64, oneway bool) error {
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		glog.Error(err)
+		return err
+	}
+	remotingCommand := remoting.NewRemotingCommandWithBody(remoting.UNLOCK_BATCH_MQ, nil, body)
+	if oneway {
+		self.remotingClient.InvokeOneWay(addr, remotingCommand, timeoutMillis)
+	} else {
+		remotingCommand, err = self.remotingClient.InvokeSync(addr, remotingCommand, timeoutMillis)
+		if err != nil {
+			glog.Error(err)
+			return err
+		} else {
+			if remotingCommand == nil || remotingCommand.Code != remoting.SUCCESS {
+				return fmt.Errorf("unlock batch mq error")
+			}
 		}
 	}
 	return nil

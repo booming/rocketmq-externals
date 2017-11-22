@@ -20,15 +20,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
-	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
-	"github.com/golang/glog"
 	"math/rand"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
+	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
+	"github.com/golang/glog"
 )
 
 type RemotingClient interface {
@@ -133,6 +134,9 @@ func (self *DefalutRemotingClient) InvokeOneWay(addr string, request *RemotingCo
 }
 
 func (self *DefalutRemotingClient) sendRequest(header, body []byte, conn net.Conn, addr string) error {
+	if conn == nil {
+		return errors.New("Connection is nil")
+	}
 	var requestBytes []byte
 	requestBytes = append(requestBytes, header...)
 	if body != nil && len(body) > 0 {

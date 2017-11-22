@@ -17,3 +17,5 @@
 package model
 
 type MessageListener func(msgs []MessageExt) ConsumeConcurrentlyResult
+
+type MessageListenerOrderly func(msgs []MessageExt) ConsumeOrderlyResult

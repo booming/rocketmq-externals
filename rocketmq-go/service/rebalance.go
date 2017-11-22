@@ -19,6 +19,11 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/constant"
@@ -26,10 +31,6 @@ import (
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/remoting"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/service/allocate_message"
 	"github.com/golang/glog"
-	"sort"
-	"strings"
-	"sync"
-	"time"
 )
 
 type Rebalance struct {
@@ -128,11 +129,11 @@ func NewRebalance(groupName string, subscription map[string]string, mqClient Roc
 	}
 }
 
-func (self *Rebalance) DoRebalance() {
+func (self *Rebalance) DoRebalance(isOrder bool) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	for topic, _ := range self.SubscriptionInner {
-		self.rebalanceByTopic(topic)
+		self.rebalanceByTopic(topic, isOrder)
 	}
 }
 
@@ -151,7 +152,7 @@ func (self ConsumerIdSorter) Less(i, j int) bool {
 	return false
 }
 
-func (self *Rebalance) rebalanceByTopic(topic string) error {
+func (self *Rebalance) rebalanceByTopic(topic string, isOrder bool) error {
 	var cidAll []string
 	cidAll, err := self.findConsumerIdList(topic, self.groupName)
 	if err != nil {
@@ -176,18 +177,18 @@ func (self *Rebalance) rebalanceByTopic(topic string) error {
 	}
 
 	glog.V(2).Infof("rebalance topic[%s]", topic)
-	self.updateProcessQueueTableInRebalance(topic, allocateResult)
+	self.updateProcessQueueTableInRebalance(topic, allocateResult, isOrder)
 	return nil
 }
 
-func (self *Rebalance) updateProcessQueueTableInRebalance(topic string, mqSet []model.MessageQueue) {
-	defer self.processQueueTableLock.RUnlock()
-	self.processQueueTableLock.RLock()
-	self.removeTheQueueDontBelongHere(topic, mqSet)
-	self.putTheQueueToProcessQueueTable(topic, mqSet)
+func (self *Rebalance) updateProcessQueueTableInRebalance(topic string, mqSet []model.MessageQueue, isOrder bool) {
+	defer self.processQueueTableLock.Unlock()
+	self.processQueueTableLock.Lock()
+	self.removeTheQueueDontBelongHere(topic, mqSet, isOrder)   // 如果严格顺序消费，释放broker队列锁
+	self.putTheQueueToProcessQueueTable(topic, mqSet, isOrder) // 如果严格顺序消费，尝试获取broker队列锁
 
 }
-func (self *Rebalance) removeTheQueueDontBelongHere(topic string, mqSet []model.MessageQueue) {
+func (self *Rebalance) removeTheQueueDontBelongHere(topic string, mqSet []model.MessageQueue, isOrder bool) {
 	// there is n^2 todo improve
 	for key, value := range self.processQueueTable {
 		if topic != key.Topic {
@@ -203,15 +204,23 @@ func (self *Rebalance) removeTheQueueDontBelongHere(topic string, mqSet []model.
 		}
 		if needDelete {
 			value.SetDrop(true)
+			if isOrder {
+				// defer value.GetLockConsume().Unlock()
+				// value.GetLockConsume().Lock()
+				self.Unlock(&key, true)
+			}
 			delete(self.processQueueTable, key)
 		}
 	}
 }
 
-func (self *Rebalance) putTheQueueToProcessQueueTable(topic string, mqSet []model.MessageQueue) {
+func (self *Rebalance) putTheQueueToProcessQueueTable(topic string, mqSet []model.MessageQueue, isOrder bool) {
 	for index, mq := range mqSet {
 		_, ok := self.processQueueTable[mq]
 		if !ok {
+			if isOrder && !self.Lock(&mq) {
+				continue
+			}
 			pullRequest := new(model.PullRequest)
 			pullRequest.ConsumerGroup = self.groupName
 			pullRequest.MessageQueue = &mqSet[index]
@@ -304,4 +313,114 @@ func (self *Rebalance) getConsumerIdListByGroup(addr string, consumerGroup strin
 		return getConsumerListByGroupResponseBody.ConsumerIdList, nil
 	}
 	return nil, errors.New("getConsumerIdListByGroup error=" + response.Remark)
+}
+
+func (self *Rebalance) Lock(mq *model.MessageQueue) bool {
+	brokerAddr := self.mqClient.FetchMasterBrokerAddress(mq.BrokerName)
+	if len(brokerAddr) == 0 {
+		self.mqClient.TryToFindTopicPublishInfo(mq.Topic)
+		brokerAddr = self.mqClient.FetchMasterBrokerAddress(mq.BrokerName)
+	}
+	if len(brokerAddr) > 0 {
+		reqBody := new(model.LockBatchRequestBody)
+		reqBody.ConsumerGroup = self.groupName
+		reqBody.ClientId = self.mqClient.GetClientId()
+		reqBody.MqSet = []*model.MessageQueue{}
+		reqBody.MqSet = append(reqBody.MqSet, mq)
+		lockedMqs, err := self.mqClient.LockBatchMQ(brokerAddr, reqBody, 1000)
+		if err != nil {
+			return false
+		}
+		lockOK := false
+		for _, mmqq := range lockedMqs {
+			pq, ok := self.processQueueTable[*mmqq]
+			if ok {
+				pq.SetLocked(true)
+				pq.SetLastLockTimestamp(time.Now())
+			}
+			if *mq == *mmqq {
+				lockOK = true
+			}
+		}
+		return lockOK
+	}
+	return false
+}
+
+func (self *Rebalance) LockAll() {
+	brokerMqs := self.buildProcessQueueTableByBrokerName()
+	for brokerName, mqs := range brokerMqs {
+		if len(mqs) == 0 {
+			continue
+		}
+		brokerAddr := self.mqClient.FetchMasterBrokerAddress(brokerName)
+		if len(brokerAddr) > 0 {
+			reqBody := new(model.LockBatchRequestBody)
+			reqBody.ConsumerGroup = self.groupName
+			reqBody.ClientId = self.mqClient.GetClientId()
+			reqBody.MqSet = mqs
+			lockedMQs, err := self.mqClient.LockBatchMQ(brokerAddr, reqBody, 1000)
+			if err != nil {
+				glog.Errorf("lockBatchMQ error, %t", err)
+				continue
+			}
+			glog.Infof("%d message queues(s) locked by %s", len(lockedMQs), self.mqClient.GetClientId())
+			lockedMQSet := map[model.MessageQueue]bool{}
+			for _, mq := range lockedMQs {
+				lockedMQSet[*mq] = true
+				pq, ok := self.processQueueTable[*mq]
+				if ok {
+					pq.SetLocked(true)
+					pq.SetLastLockTimestamp(time.Now())
+				}
+			}
+
+			for _, mq := range mqs {
+				_, ok := lockedMQSet[*mq]
+				if !ok {
+					pq, ok := self.processQueueTable[*mq]
+					if !ok {
+						pq.SetLocked(false)
+						glog.Warningf("the message queue locked Failed, Group: %s %+v", self.groupName, mq)
+					}
+				}
+			}
+		}
+
+	}
+}
+
+func (self *Rebalance) Unlock(mq *model.MessageQueue, oneway bool) {
+	brokerAddr := self.mqClient.FetchMasterBrokerAddress(mq.BrokerName)
+	if len(brokerAddr) == 0 {
+		self.mqClient.TryToFindTopicPublishInfo(mq.Topic)
+		brokerAddr = self.mqClient.FetchMasterBrokerAddress(mq.BrokerName)
+	}
+	if len(brokerAddr) > 0 {
+		reqBody := new(model.UnlockBatchRequestBody)
+		reqBody.ConsumerGroup = self.groupName
+		reqBody.ClientId = self.mqClient.GetClientId()
+		reqBody.MqSet = []*model.MessageQueue{}
+		reqBody.MqSet = append(reqBody.MqSet, mq)
+		err := self.mqClient.UnlockBatchMQ(brokerAddr, reqBody, 1000, oneway)
+		if err != nil {
+			glog.Errorf("unlockBatchMQ error, %s %+v", err, *mq)
+		}
+	}
+}
+
+func (self *Rebalance) buildProcessQueueTableByBrokerName() map[string][]*model.MessageQueue {
+	qmap := map[string][]*model.MessageQueue{}
+	defer self.processQueueTableLock.RUnlock()
+	self.processQueueTableLock.RLock()
+	for mq := range self.processQueueTable {
+		mqs, ok := qmap[mq.BrokerName]
+		if !ok {
+			mqs = []*model.MessageQueue{}
+		}
+		// clone message queue
+		mqs = append(mqs, &model.MessageQueue{Topic: mq.Topic, BrokerName: mq.BrokerName, QueueId: mq.QueueId})
+		qmap[mq.BrokerName] = mqs
+	}
+	return qmap
 }

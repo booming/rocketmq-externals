@@ -65,4 +65,6 @@ func (self MqClientManager) StartAllScheduledTask() {
 
 	//cleanExpireMsg
 	self.cleanExpireMsgController.Start()
+
+	self.lockMQController.Start()
 }

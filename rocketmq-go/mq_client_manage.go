@@ -20,6 +20,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/config"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/constant"
@@ -28,9 +32,6 @@ import (
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/service"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util/structs"
 	"github.com/golang/glog"
-	"strings"
-	"sync"
-	"time"
 )
 
 //@see com.alibaba.rocketmq.client.impl.factory.MQClientInstance
@@ -57,6 +58,7 @@ type MqClientManager struct {
 	pullMessageController    *PullMessageController
 	cleanExpireMsgController *CleanExpireMsgController
 	rebalanceControllr       *RebalanceController
+	lockMQController         *LockMQController
 	//should be here because need all producer consumer
 	defaultProducerService *service.DefaultProducerService //for send back message
 }
@@ -69,7 +71,7 @@ func MqClientManagerInit(clientConfig *config.ClientConfig) (rocketMqManager *Mq
 	rocketMqManager.pullMessageController = NewPullMessageController(rocketMqManager.mqClient, rocketMqManager.clientFactory)
 	rocketMqManager.cleanExpireMsgController = NewCleanExpireMsgController(rocketMqManager.mqClient, rocketMqManager.clientFactory)
 	rocketMqManager.rebalanceControllr = NewRebalanceController(rocketMqManager.clientFactory)
-
+	rocketMqManager.lockMQController = NewLockMQController(rocketMqManager.clientFactory)
 	return
 }
 
@@ -187,7 +189,7 @@ func (self *MqClientManager) RegistConsumer(consumer *DefaultMQPushConsumer) {
 
 	fmt.Println(consumer.consumeMessageService)
 
-	consumer.consumeMessageService.Init(consumer.consumerGroup, self.mqClient, consumer.offsetStore, self.defaultProducerService, consumer.ConsumerConfig)
+	consumer.consumeMessageService.Init(consumer.consumerGroup, self.mqClient, consumer.rebalance, consumer.offsetStore, self.defaultProducerService, consumer.ConsumerConfig)
 	return
 }
 

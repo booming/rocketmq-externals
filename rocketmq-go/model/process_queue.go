@@ -17,23 +17,24 @@
 package model
 
 import (
+	"sync"
+	"time"
+
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/model/constant"
 	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
 	"github.com/emirpasic/gods/maps/treemap"
 	"github.com/golang/glog"
-	"sync"
-	"time"
 )
 
 type ProcessQueue struct {
 	msgTreeMap            *treemap.Map // int | MessageExt
-	msgCount              int
+	msgCount              int          // for flow control
 	lockTreeMap           sync.RWMutex
 	locked                bool
 	lastPullTimestamp     time.Time
 	lastConsumeTimestamp  time.Time
 	lastLockTimestamp     time.Time
-	lockConsume           sync.RWMutex
+	lockConsume           sync.Mutex
 	consuming             bool
 	queueOffsetMax        int64
 	dropped               bool
@@ -47,12 +48,34 @@ func NewProcessQueue() (processQueue *ProcessQueue) {
 	processQueue.dropped = false
 	processQueue.msgTreeMap = treemap.NewWithIntComparator()
 	processQueue.msgTreeMapToBeConsume = treemap.NewWithIntComparator()
+	processQueue.lastLockTimestamp = time.Now()
 
 	return
 }
+
+func (self *ProcessQueue) GetLockConsume() *sync.Mutex {
+	return &self.lockConsume
+}
+
+func (self *ProcessQueue) IsLocked() bool {
+	return self.locked
+}
+
+func (self *ProcessQueue) SetLocked(locked bool) {
+	self.locked = locked
+}
+
+func (self *ProcessQueue) SetLastLockTimestamp(timestamp time.Time) {
+	self.lastLockTimestamp = timestamp
+}
+
+func (self *ProcessQueue) IsLockExpired() bool {
+	return time.Now().Sub(self.lastLockTimestamp) > 30*time.Second
+}
+
 func (self *ProcessQueue) GetMsgCount() int {
-	defer self.lockTreeMap.Unlock()
-	self.lockTreeMap.Lock()
+	defer self.lockTreeMap.RUnlock()
+	self.lockTreeMap.RLock()
 	return self.msgCount
 }
 
@@ -190,4 +213,38 @@ func (self *ProcessQueue) PutMessage(msgs []MessageExt) (dispatchToConsume bool)
 		}
 	}
 	return
+}
+
+func (self *ProcessQueue) Commit(msgs []MessageExt) int64 {
+	defer self.lockTreeMap.Unlock()
+	self.lockTreeMap.Lock()
+	self.msgCount = self.msgCount - len(msgs)
+	return msgs[len(msgs)-1].QueueOffset + 1
+}
+
+func (self *ProcessQueue) MakeMessagesConsumeAgain(msgs []MessageExt) {
+	defer self.lockTreeMap.Unlock()
+	self.lockTreeMap.Lock()
+	for _, msg := range msgs {
+		self.msgTreeMap.Put(int(msg.QueueOffset), msg)
+	}
+}
+
+func (self *ProcessQueue) TakeMessages(batchSize int) []MessageExt {
+	defer self.lockTreeMap.Unlock()
+	self.lockTreeMap.Lock()
+	msgs := []MessageExt{}
+	self.lastConsumeTimestamp = time.Now()
+	if !self.msgTreeMap.Empty() {
+		keys := self.msgTreeMap.Keys()
+		vals := self.msgTreeMap.Values()
+		for i := 0; i < batchSize && i < len(keys); i++ {
+			msgs = append(msgs, vals[i].(MessageExt))
+			self.msgTreeMap.Remove(keys[i])
+		}
+	}
+	if len(msgs) == 0 {
+		self.consuming = false
+	}
+	return msgs
 }
