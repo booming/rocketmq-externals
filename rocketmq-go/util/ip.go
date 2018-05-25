@@ -58,7 +58,7 @@ func getIp() (ip net.IP) {
 			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 				if ipnet.IP.To4() != nil {
 					currIp := ipnet.IP.String()
-					if !strings.Contains(currIp, ":") && currIp != "127.0.0.1" && isIntranetIpv4(currIp) {
+					if !strings.Contains(currIp, ":") && currIp != "127.0.0.1" && !isIntranetIpv4(currIp) {
 						ip = ipnet.IP
 					}
 				}
